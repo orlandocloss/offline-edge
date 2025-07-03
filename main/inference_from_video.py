@@ -14,10 +14,15 @@ from models.insect_tracker import InsectTracker
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Force immediate output flushing
+def flush_print(msg):
+    print(msg)
+    sys.stdout.flush()
+
 class VideoInferenceProcessor:
     def __init__(self, detections_dir="detections", sanity_videos_dir="sanity_videos",
                  model_path="weights/small-generic.hef", labels_path="data/labels.txt",
-                 batch_size=1, confidence_threshold=0.35, device_id="video_processor"):
+                 batch_size=1, confidence_threshold=0.35, device_id="video_processor", verbose=False):
         
         # Model and processor configuration
         self.model_path = model_path
@@ -25,6 +30,7 @@ class VideoInferenceProcessor:
         self.batch_size = batch_size
         self.confidence_threshold = confidence_threshold
         self.device_id = device_id
+        self.verbose = verbose
         
         # Local storage directories
         self.detections_dir = Path(detections_dir)
@@ -43,6 +49,9 @@ class VideoInferenceProcessor:
         
         self.det_utils = ObjectDetectionUtils(labels_path)
         
+        if self.verbose:
+            flush_print("✅ Video inference processor initialized with verbose mode")
+        
     def _ensure_weights_exist(self):
         """Check if weight files exist and download them if they don't."""
         weights_info = [
@@ -56,15 +65,15 @@ class VideoInferenceProcessor:
         weights_dir = os.path.dirname(self.model_path)
         if weights_dir and not os.path.exists(weights_dir):
             os.makedirs(weights_dir)
-            print(f"Created directory: {weights_dir}")
+            flush_print(f"📁 Created directory: {weights_dir}")
         
         for weight_info in weights_info:
             weight_path = weight_info['path']
             weight_url = weight_info['url']
             
             if not os.path.exists(weight_path):
-                print(f"Weight file not found: {weight_path}")
-                print(f"Downloading from: {weight_url}")
+                flush_print(f"⚠️ Weight file not found: {weight_path}")
+                flush_print(f"📥 Downloading from: {weight_url}")
                 
                 try:
                     import requests
@@ -84,15 +93,15 @@ class VideoInferenceProcessor:
                                 # Show progress every 10MB
                                 if total_size > 0 and downloaded_size % (10 * 1024 * 1024) == 0:
                                     progress = (downloaded_size / total_size) * 100
-                                    print(f"Download progress: {progress:.1f}% ({downloaded_size // (1024*1024)}MB/{total_size // (1024*1024)}MB)")
+                                    flush_print(f"📥 Download progress: {progress:.1f}% ({downloaded_size // (1024*1024)}MB/{total_size // (1024*1024)}MB)")
                     
-                    print(f"Successfully downloaded: {weight_path}")
+                    flush_print(f"✅ Successfully downloaded: {weight_path}")
                     
                 except Exception as e:
-                    logger.error(f"Failed to download {weight_path}: {e}")
+                    flush_print(f"❌ Failed to download {weight_path}: {e}")
                     raise RuntimeError(f"Could not download required weight file: {weight_path}")
             else:
-                print(f"Weight file found: {weight_path}")
+                flush_print(f"✅ Weight file found: {weight_path}")
     
     def convert_bbox_to_normalized(self, x, y, x2, y2, width, height):
         x_center = (x + x2) / 2.0 / width
@@ -134,11 +143,14 @@ class VideoInferenceProcessor:
                     f.write(f"bbox_pixels: {pixel_coords[0]} {pixel_coords[1]} {pixel_coords[2]} {pixel_coords[3]}\n")
             
             self.detection_count += 1
-            print(f"💾 Saved detection {self.detection_count}: {frame_filename} and {txt_filename}")
-            sys.stdout.flush()
+            flush_print(f"💾 Saved detection {self.detection_count}: {frame_filename} and {txt_filename}")
 
         except Exception as e:
-            print(f"Error saving detection locally: {e}")
+            flush_print(f"❌ Error saving detection locally: {e}")
+            if self.verbose:
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
     
     def process_frame(self, frame, frame_time_seconds, tracker, global_frame_count, show_boxes=False):
         """Process a single frame from the video."""
@@ -148,16 +160,24 @@ class VideoInferenceProcessor:
         # Convert BGR to RGB for inference
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        infer_results = run_inference(
-            net=self.model_path,
-            input=rgb_frame,
-            batch_size=self.batch_size,
-            labels=self.labels_path,
-            save_stream_output=False
-        )
+        try:
+            infer_results = run_inference(
+                net=self.model_path,
+                input=rgb_frame,
+                batch_size=self.batch_size,
+                labels=self.labels_path,
+                save_stream_output=False
+            )
+        except Exception as e:
+            flush_print(f"❌ Error running inference on frame {self.frame_count}: {e}")
+            if self.verbose:
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
+            return frame
         
-        if show_boxes:
-            print(f"Frame {self.frame_count} ({frame_time_seconds:.2f}s): Found {len(infer_results)} raw detections")
+        if show_boxes or self.verbose:
+            flush_print(f"🔍 Frame {self.frame_count} ({frame_time_seconds:.2f}s): Found {len(infer_results)} raw detections")
         
         # First pass: collect all valid detections for tracking
         valid_detections = []
@@ -194,10 +214,19 @@ class VideoInferenceProcessor:
                 })
         
         # Update tracker with detections using the global frame count
-        track_ids = tracker.update(valid_detections, global_frame_count)
+        try:
+            track_ids = tracker.update(valid_detections, global_frame_count)
+        except Exception as e:
+            flush_print(f"❌ Error updating tracker: {e}")
+            if self.verbose:
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
+            # Use empty track IDs if tracker fails
+            track_ids = [None] * len(valid_detections)
         
-        if show_boxes and len(valid_detections) > 0:
-            print(f"Frame {self.frame_count}: {len(valid_detections)} detections → {len(tracker.current_tracks)} active tracks")
+        if (show_boxes or self.verbose) and len(valid_detections) > 0:
+            flush_print(f"📊 Frame {self.frame_count}: {len(valid_detections)} detections → {len(track_ids)} track IDs assigned")
         
         # Process each detection with its track ID
         for i, det_data in enumerate(valid_detection_data):
@@ -242,8 +271,8 @@ def process_video(video_path, processor, tracker, start_frame_count, show_video=
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
     
-    print(f"Processing video: {video_path}")
-    print(f"Video properties: {total_frames} frames, {fps:.2f} FPS, {duration:.2f}s duration")
+    flush_print(f"🎬 Processing video: {os.path.basename(video_path)}")
+    flush_print(f"📊 Video properties: {total_frames} frames, {fps:.2f} FPS, {duration:.2f}s duration")
     
     # Set up output video writer if requested
     out = None
@@ -252,10 +281,11 @@ def process_video(video_path, processor, tracker, start_frame_count, show_video=
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        print(f"Output video will be saved to: {output_video_path}")
+        flush_print(f"📹 Output video will be saved to: {output_video_path}")
     
     frame_number = 0
     start_time = time.time()
+    last_progress_time = start_time
     
     try:
         while True:
@@ -277,19 +307,23 @@ def process_video(video_path, processor, tracker, start_frame_count, show_video=
             if show_video:
                 cv2.imshow('Video Inference', processed_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print("User requested quit")
+                    flush_print("🛑 User requested quit")
                     break
             
             frame_number += 1
             
-            # Progress update every 100 frames
-            if frame_number % 100 == 0:
+            # Progress update every 100 frames or every 10 seconds
+            current_time = time.time()
+            if frame_number % 100 == 0 or (current_time - last_progress_time) >= 10:
                 progress = (frame_number / total_frames) * 100
-                elapsed = time.time() - start_time
-                estimated_total = (elapsed / frame_number) * total_frames if frame_number > 0 else 0
-                remaining = estimated_total - elapsed
-                print(f"Progress: {frame_number}/{total_frames} ({progress:.1f}%) - "
-                      f"ETA: {remaining:.1f}s")
+                elapsed = current_time - start_time
+                if frame_number > 0:
+                    estimated_total = (elapsed / frame_number) * total_frames
+                    remaining = estimated_total - elapsed
+                    processing_fps = frame_number / elapsed
+                    flush_print(f"⏳ Progress: {frame_number}/{total_frames} ({progress:.1f}%) - "
+                              f"ETA: {remaining:.1f}s, Processing: {processing_fps:.1f} FPS")
+                last_progress_time = current_time
     
     finally:
         cap.release()
@@ -299,8 +333,8 @@ def process_video(video_path, processor, tracker, start_frame_count, show_video=
             cv2.destroyAllWindows()
     
     processing_time = time.time() - start_time
-    print(f"\nProcessing complete!")
-    print(f"Processed {frame_number} frames in {processing_time:.2f}s")
-    print(f"Average processing speed: {frame_number/processing_time:.2f} FPS")
-    print(f"Total detections saved: {processor.detection_count}")
+    flush_print(f"✅ Processing complete!")
+    flush_print(f"📊 Processed {frame_number} frames in {processing_time:.2f}s")
+    flush_print(f"📊 Average processing speed: {frame_number/processing_time:.2f} FPS")
+    flush_print(f"📊 Total detections saved: {processor.detection_count}")
     return frame_number 

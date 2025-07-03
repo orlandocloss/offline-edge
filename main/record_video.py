@@ -4,16 +4,22 @@ import os
 import threading
 import queue
 import logging
+import sys
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from picamera2 import Picamera2
 
 logger = logging.getLogger(__name__)
 
+# Force immediate output flushing
+def flush_print(msg):
+    print(msg)
+    sys.stdout.flush()
+
 class VideoRecorder:
     def __init__(self, output_dir="recordings", fps=15, resolution=(640, 640), 
                  recording_duration=300, device_id="recorder", video_queue=None,
-                 recording_start_hour=6, recording_end_hour=22):
+                 recording_start_hour=6, recording_end_hour=22, verbose=False):
         """
         Initialize the video recorder for gapless recording.
         
@@ -26,6 +32,7 @@ class VideoRecorder:
             video_queue: A queue to put the finished video file paths into.
             recording_start_hour: Hour to start recording (24-hour format, default 6 = 6am)
             recording_end_hour: Hour to stop recording (24-hour format, default 22 = 10pm)
+            verbose: Enable verbose debug output
         """
         self.output_dir = Path(output_dir)
         self.fps = fps
@@ -35,6 +42,7 @@ class VideoRecorder:
         self.video_queue = video_queue
         self.recording_start_hour = recording_start_hour
         self.recording_end_hour = recording_end_hour
+        self.verbose = verbose
         
         self.output_dir.mkdir(exist_ok=True, parents=True)
         
@@ -45,9 +53,9 @@ class VideoRecorder:
         self.frame_queue = queue.Queue(maxsize=fps * 5) # Buffer 5 seconds of frames
         self.frame_grabber_thread = None
         
-        logger.info("Video Recorder component initialized.")
-        logger.info(f"  - FPS: {self.fps}, Resolution: {self.resolution}")
-        logger.info(f"  - Recording schedule: {self.recording_start_hour:02d}:00 - {self.recording_end_hour:02d}:00")
+        flush_print("✅ Video Recorder component initialized.")
+        flush_print(f"  - FPS: {self.fps}, Resolution: {self.resolution}")
+        flush_print(f"  - Recording schedule: {self.recording_start_hour:02d}:00 - {self.recording_end_hour:02d}:00")
     
     def is_recording_time(self):
         """Check if current time is within recording hours."""
@@ -57,6 +65,7 @@ class VideoRecorder:
     def initialize_camera(self):
         """Initialize and configure the camera."""
         try:
+            flush_print("📸 Initializing camera...")
             self.picam2 = Picamera2()
             camera_config = self.picam2.create_video_configuration(
                 main={"format": 'RGB888', "size": self.resolution}
@@ -67,46 +76,68 @@ class VideoRecorder:
                 "AfMode": 0, "LensPosition": 0.0,
             })
             self.picam2.start()
-            logger.info("Camera initializing...")
+            flush_print("⏳ Camera initializing (waiting 2 seconds)...")
             time.sleep(2)
-            logger.info("Camera ready.")
+            flush_print("✅ Camera ready.")
         except Exception as e:
-            logger.error(f"Failed to initialize camera: {e}", exc_info=True)
+            flush_print(f"❌ Failed to initialize camera: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
             raise
 
     def _stop_camera(self):
         """Stop the camera and frame grabber thread."""
+        if self.verbose:
+            flush_print("🔄 Stopping camera and frame grabber...")
+        
         self.stop_event.set()
         
         if self.frame_grabber_thread and self.frame_grabber_thread.is_alive():
+            if self.verbose:
+                flush_print("⏳ Waiting for frame grabber thread to stop...")
             self.frame_grabber_thread.join(timeout=2)
             
         if self.picam2:
             try:
                 self.picam2.stop()
-                logger.info("📸 Camera stopped for time restriction")
+                flush_print("📸 Camera stopped for time restriction")
             except Exception as e:
-                logger.warning(f"Warning: Error stopping camera: {e}")
+                flush_print(f"⚠️ Warning: Error stopping camera: {e}")
         
         # Clear the stop event so recording can resume later
         self.stop_event.clear()
+        if self.verbose:
+            flush_print("✅ Camera and frame grabber stopped")
 
     def _frame_grabber(self):
         """Continuously grabs frames from the camera and puts them in a queue."""
-        logger.info("📹 Frame grabber thread started.")
+        flush_print("📹 Frame grabber thread started.")
+        frame_count = 0
         while not self.stop_event.is_set():
             try:
                 frame = self.picam2.capture_array()
-                self.frame_queue.put(frame)
-            except Exception:
+                try:
+                    self.frame_queue.put(frame, timeout=0.1)
+                    frame_count += 1
+                    if self.verbose and frame_count % 100 == 0:
+                        flush_print(f"📹 Frame grabber: {frame_count} frames captured, queue size: {self.frame_queue.qsize()}")
+                except queue.Full:
+                    if self.verbose:
+                        flush_print("⚠️ Frame queue full, dropping frame")
+                    continue
+            except Exception as e:
                 if not self.stop_event.is_set():
-                    logger.exception("Error in frame grabber thread.")
+                    flush_print(f"❌ Error in frame grabber thread: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
                 break
-        logger.info("📹 Frame grabber thread stopped.")
+        flush_print("📹 Frame grabber thread stopped.")
 
     def record_segment(self, output_path):
         """Record a single video segment by consuming frames from the queue."""
-        logger.info(f"🎬 Recording new segment: {output_path.name}")
+        flush_print(f"🎬 Recording new segment: {output_path.name}")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(str(output_path), fourcc, self.fps, self.resolution)
         
@@ -115,6 +146,7 @@ class VideoRecorder:
 
         start_time = time.time()
         frame_count = 0
+        last_progress_time = start_time
         
         try:
             while time.time() - start_time < self.recording_duration:
@@ -122,74 +154,107 @@ class VideoRecorder:
                     frame = self.frame_queue.get(timeout=1)
                     out.write(frame)
                     frame_count += 1
+                    
+                    # Progress update every 30 seconds or if verbose every 10 seconds
+                    current_time = time.time()
+                    progress_interval = 10 if self.verbose else 30
+                    if current_time - last_progress_time >= progress_interval:
+                        elapsed = current_time - start_time
+                        remaining = self.recording_duration - elapsed
+                        progress = (elapsed / self.recording_duration) * 100
+                        flush_print(f"🎬 Recording progress: {progress:.1f}% ({elapsed:.0f}s/{self.recording_duration}s), {frame_count} frames, queue: {self.frame_queue.qsize()}")
+                        last_progress_time = current_time
+                    
                 except queue.Empty:
                     if self.stop_event.is_set():
-                        logger.info("Stop event received, finishing current segment early.")
+                        flush_print("🛑 Stop event received, finishing current segment early.")
                         break
+                    if self.verbose:
+                        flush_print("⏳ No frames available, waiting...")
                     continue
         finally:
             out.release()
             
         file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        logger.info(f"  ✅ Segment complete: {output_path.name} ({frame_count} frames, {file_size_mb:.1f} MB)")
+        recording_time = time.time() - start_time
+        actual_fps = frame_count / recording_time if recording_time > 0 else 0
+        flush_print(f"✅ Segment complete: {output_path.name} ({frame_count} frames, {file_size_mb:.1f} MB, {actual_fps:.1f} FPS)")
         
         if self.video_queue:
             self.video_queue.put(output_path)
+            flush_print(f"📤 Added to processing queue: {output_path.name}")
     
     def start_continuous_recording(self):
         """Start continuous recording loop. This is intended to be the target of a thread."""
-        logger.info("🚀 Starting continuous recording loop...")
+        flush_print("🚀 Starting continuous recording loop...")
         camera_initialized = False
         
         try:
             while not self.stop_event.is_set():
+                current_time = datetime.now()
+                current_hour = current_time.hour
+                
                 if self.is_recording_time():
                     # Initialize camera only when we need to record
                     if not camera_initialized:
-                        logger.info("⏰ Entered recording hours - initializing camera...")
+                        flush_print(f"⏰ Entered recording hours (current time: {current_time.strftime('%H:%M:%S')}) - initializing camera...")
                         self.initialize_camera()
                         self.frame_grabber_thread = threading.Thread(target=self._frame_grabber, daemon=True)
                         self.frame_grabber_thread.start()
                         camera_initialized = True
                     
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    timestamp = current_time.strftime("%Y%m%d_%H%M%S")
                     filename = f"{self.device_id}_{timestamp}.mp4"
                     output_path = self.output_dir / filename
                     
-                    self.record_segment(output_path)
+                    try:
+                        self.record_segment(output_path)
+                    except Exception as e:
+                        flush_print(f"❌ Error recording segment: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        sys.stdout.flush()
+                        # Continue to next segment
+                        continue
+                        
                 else:
                     # Outside recording hours
                     if camera_initialized:
-                        logger.info("⏰ Exited recording hours - stopping camera...")
+                        flush_print(f"⏰ Exited recording hours (current time: {current_time.strftime('%H:%M:%S')}) - stopping camera...")
                         self._stop_camera()
                         camera_initialized = False
                     
                     # Sleep for a minute before checking time again
-                    current_time = datetime.now().strftime("%H:%M")
-                    logger.info(f"😴 Outside recording hours (current time: {current_time}). Checking again in 60 seconds...")
-                    time.sleep(60)
+                    next_check = 60 - current_time.second  # Sleep until next minute
+                    if self.verbose:
+                        flush_print(f"😴 Outside recording hours (current time: {current_time.strftime('%H:%M:%S')}). Sleeping for {next_check}s...")
+                    time.sleep(next_check)
         
         except Exception as e:
              if not self.stop_event.is_set():
-                logger.error(f"❌ Fatal error in recording loop: {e}", exc_info=True)
+                flush_print(f"❌ Fatal error in recording loop: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
         finally:
              if camera_initialized:
                  self._stop_camera()
-             logger.info("🎥 Recording loop has finished.")
+             flush_print("🎥 Recording loop has finished.")
 
     def stop(self):
         """Signals all internal loops to stop and cleans up resources."""
-        logger.info("🔄 Stopping recorder component...")
+        flush_print("🔄 Stopping recorder component...")
         self.stop_event.set()
         
         if self.frame_grabber_thread and self.frame_grabber_thread.is_alive():
+            flush_print("⏳ Waiting for frame grabber thread to stop...")
             self.frame_grabber_thread.join(timeout=2)
             
         if self.picam2:
             try:
                 self.picam2.stop()
-                logger.info("📸 Camera stopped")
+                flush_print("📸 Camera stopped")
             except Exception as e:
-                logger.warning(f"Warning: Error stopping camera: {e}")
+                flush_print(f"⚠️ Warning: Error stopping camera: {e}")
         
-        logger.info("✅ Recorder component stopped.") 
+        flush_print("✅ Recorder component stopped.") 

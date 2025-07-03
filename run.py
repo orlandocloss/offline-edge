@@ -6,6 +6,7 @@ import argparse
 import random
 import logging
 import cv2
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -14,15 +15,26 @@ from main.record_video import VideoRecorder
 from main.inference_from_video import VideoInferenceProcessor, process_video
 from models.insect_tracker import InsectTracker
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set up logging with immediate flushing for SSH
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
+
+# Force immediate output flushing
+def flush_print(msg):
+    print(msg)
+    sys.stdout.flush()
 
 class ContinuousPipeline:
     def __init__(self, video_dir="recordings", recording_duration=300, sanity_video_percentage=10, 
                  device_id="pipeline", fps=15, resolution=(640, 640), 
                  confidence_threshold=0.35, detections_dir="detections", sanity_videos_dir="sanity_videos",
-                 recording_start_hour=6, recording_end_hour=22):
+                 recording_start_hour=6, recording_end_hour=22, verbose=False):
         """
         Initialize the continuous pipeline using imported components.
         """
@@ -33,6 +45,7 @@ class ContinuousPipeline:
         self.resolution = resolution
         self.recording_start_hour = recording_start_hour
         self.recording_end_hour = recording_end_hour
+        self.verbose = verbose
         
         # Local storage directories
         self.detections_dir = Path(detections_dir)
@@ -41,6 +54,8 @@ class ContinuousPipeline:
         # Create directories if they don't exist
         self.detections_dir.mkdir(exist_ok=True, parents=True)
         self.sanity_videos_dir.mkdir(exist_ok=True, parents=True)
+        
+        flush_print(f"✅ Created directories: {self.detections_dir}, {self.sanity_videos_dir}")
         
         # Threading controls
         self.stop_event = threading.Event()
@@ -51,16 +66,17 @@ class ContinuousPipeline:
         self.tracker = None
         
         # --- Centralized Tracker Initialization ---
-        logger.info("Initializing insect tracker...")
+        flush_print("🔄 Initializing insect tracker...")
         try:
             width, height = self.resolution
             self.tracker = InsectTracker(height, width, max_frames=30, w_dist=0.7, w_area=0.3, cost_threshold=0.8)
-            logger.info("✅ Insect tracker initialized successfully.")
+            flush_print("✅ Insect tracker initialized successfully.")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize insect tracker: {e}. Exiting.")
+            flush_print(f"❌ Failed to initialize insect tracker: {e}")
             raise
         
         # Initialize components
+        flush_print("🔄 Initializing video recorder...")
         self.recorder = VideoRecorder(
             output_dir=str(self.video_dir),
             fps=fps,
@@ -69,61 +85,74 @@ class ContinuousPipeline:
             device_id=self.device_id,
             video_queue=self.video_queue,
             recording_start_hour=self.recording_start_hour,
-            recording_end_hour=self.recording_end_hour
+            recording_end_hour=self.recording_end_hour,
+            verbose=self.verbose
         )
+        flush_print("✅ Video recorder initialized.")
         
         # Threads
         self.recorder_thread = None
         self.processor_thread = None
         
-        logger.info("🚀 Continuous Pipeline initialized")
-        logger.info(f"📁 Detections directory: {self.detections_dir}")
-        logger.info(f"📁 Sanity videos directory: {self.sanity_videos_dir}")
-        logger.info(f"⏰ Recording schedule: {self.recording_start_hour:02d}:00 - {self.recording_end_hour:02d}:00")
-        logger.info("ℹ️  Video processing will continue 24/7, but new recordings only during scheduled hours")
+        flush_print("🚀 Continuous Pipeline initialized")
+        flush_print(f"📁 Detections directory: {self.detections_dir}")
+        flush_print(f"📁 Sanity videos directory: {self.sanity_videos_dir}")
+        flush_print(f"⏰ Recording schedule: {self.recording_start_hour:02d}:00 - {self.recording_end_hour:02d}:00")
+        flush_print("ℹ️  Video processing will continue 24/7, but new recordings only during scheduled hours")
 
     def processor_worker(self):
         """Worker thread to process videos from the queue."""
-        logger.info("🔍 Starting video processor worker...")
+        flush_print("🔍 Starting video processor worker...")
         
         while not self.stop_event.is_set() or not self.video_queue.empty():
             try:
+                if self.verbose:
+                    flush_print(f"📋 Queue size: {self.video_queue.qsize()}, Stop event: {self.stop_event.is_set()}")
+                
                 video_path = self.video_queue.get(timeout=1)
                 
-                logger.info(f"--- Processing Video: {video_path.name} ---")
+                flush_print(f"--- Processing Video: {video_path.name} ---")
                 
                 self.run_inference_on_video(video_path)
                 self.save_sanity_video(video_path)
                 self.delete_video(video_path)
                 
                 self.video_queue.task_done()
+                flush_print(f"✅ Finished processing: {video_path.name}")
                 
             except queue.Empty:
+                if self.verbose:
+                    flush_print("⏳ Queue empty, checking stop event...")
                 if self.stop_event.is_set():
+                    flush_print("🛑 Stop event set, breaking from processor loop")
                     break
                 continue
             except Exception as e:
-                logger.error(f"❌ Processor worker error: {e}", exc_info=True)
+                flush_print(f"❌ Processor worker error: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
         
-        logger.info("🔍 Video processor worker stopped")
+        flush_print("🔍 Video processor worker stopped")
 
     def run_inference_on_video(self, video_path):
         """Run the full inference process on a video file."""
-        logger.info(f"🧠 Running inference on {video_path.name}")
+        flush_print(f"🧠 Running inference on {video_path.name}")
         
         # Log tracking state before processing
         if self.tracker:
             stats = self.tracker.get_tracking_stats()
-            logger.info(f"📊 Tracker state before {video_path.name}: {stats['active_tracks']} active, {stats['lost_tracks']} lost tracks")
+            flush_print(f"📊 Tracker state before {video_path.name}: {stats['active_tracks']} active, {stats['lost_tracks']} lost tracks")
             if stats['active_tracks'] > 0:
-                logger.info(f"🔗 Cross-video tracking: Continuing with existing tracks: {stats['active_track_ids'][:3]}{'...' if len(stats['active_track_ids']) > 3 else ''}")
+                flush_print(f"🔗 Cross-video tracking: Continuing with existing tracks: {stats['active_track_ids'][:3]}{'...' if len(stats['active_track_ids']) > 3 else ''}")
         
         try:
             processor = VideoInferenceProcessor(
                 detections_dir=str(self.detections_dir),
                 sanity_videos_dir=str(self.sanity_videos_dir),
                 device_id=self.device_id,
-                confidence_threshold=self.confidence_threshold
+                confidence_threshold=self.confidence_threshold,
+                verbose=self.verbose
             )
             frames_processed = process_video(
                 video_path=str(video_path), 
@@ -136,10 +165,13 @@ class ContinuousPipeline:
             # Log tracking state after processing
             if self.tracker:
                 stats_after = self.tracker.get_tracking_stats()
-                logger.info(f"📊 Tracker state after {video_path.name}: {stats_after['active_tracks']} active, {stats_after['lost_tracks']} lost tracks")
+                flush_print(f"📊 Tracker state after {video_path.name}: {stats_after['active_tracks']} active, {stats_after['lost_tracks']} lost tracks")
 
         except Exception as e:
-            logger.error(f"Error during inference for {video_path.name}: {e}")
+            flush_print(f"❌ Error during inference for {video_path.name}: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
 
     def should_save_sanity_video(self):
         """Determine if this video should be saved as a sanity video based on percentage."""
@@ -154,11 +186,11 @@ class ContinuousPipeline:
             return
         
         if not self.should_save_sanity_video():
-            logger.info(f"🎯 Skipping sanity video for {video_path.name} (random selection)")
+            flush_print(f"🎯 Skipping sanity video for {video_path.name} (random selection)")
             return
         
         if not (0 < self.sanity_video_percentage <= 100):
-            logger.error(f"Invalid sanity video percentage: {self.sanity_video_percentage}. Must be between 1 and 100.")
+            flush_print(f"❌ Invalid sanity video percentage: {self.sanity_video_percentage}. Must be between 1 and 100.")
             return
 
         cap = None
@@ -166,7 +198,7 @@ class ContinuousPipeline:
         try:
             cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
-                logger.error(f"Could not open video file to create sanity video: {video_path.name}")
+                flush_print(f"❌ Could not open video file to create sanity video: {video_path.name}")
                 return
 
             fps = cap.get(cv2.CAP_PROP_FPS)
@@ -175,13 +207,13 @@ class ContinuousPipeline:
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
             if total_frames == 0 or fps == 0:
-                logger.error(f"Video {video_path.name} has no frames or invalid FPS, cannot create sanity video.")
+                flush_print(f"❌ Video {video_path.name} has no frames or invalid FPS, cannot create sanity video.")
                 return
 
             # Calculate segment length in frames
             segment_length_frames = int(total_frames * (self.sanity_video_percentage / 100.0))
             if segment_length_frames <= 0:
-                logger.warning(f"Calculated segment length is 0 frames for {video_path.name}. Skipping sanity video.")
+                flush_print(f"⚠️ Calculated segment length is 0 frames for {video_path.name}. Skipping sanity video.")
                 return
 
             # Determine random start frame
@@ -191,7 +223,7 @@ class ContinuousPipeline:
             # Create sanity video path
             sanity_video_path = self.sanity_videos_dir / f"sanity_{video_path.name}"
 
-            logger.info(f"🎬 Creating a {self.sanity_video_percentage}% ({segment_length_frames / fps:.1f}s) sanity video from {video_path.name}")
+            flush_print(f"🎬 Creating a {self.sanity_video_percentage}% ({segment_length_frames / fps:.1f}s) sanity video from {video_path.name}")
             
             # Set up writer for the sanity video
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -208,10 +240,13 @@ class ContinuousPipeline:
                 out.write(frame)
                 frames_written += 1
 
-            logger.info(f"✅ Sanity video saved: {sanity_video_path.name}")
+            flush_print(f"✅ Sanity video saved: {sanity_video_path.name}")
             
         except Exception as e:
-            logger.error(f"❌ Error creating sanity video for {video_path.name}: {e}", exc_info=True)
+            flush_print(f"❌ Error creating sanity video for {video_path.name}: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
         finally:
             if cap:
                 cap.release()
@@ -222,55 +257,78 @@ class ContinuousPipeline:
         """Delete a video file after processing."""
         try:
             video_path.unlink()
-            logger.info(f"🗑️ Deleted video: {video_path.name}")
+            flush_print(f"🗑️ Deleted video: {video_path.name}")
         except Exception as e:
-            logger.error(f"⚠️ Could not delete video {video_path.name}: {e}")
+            flush_print(f"⚠️ Could not delete video {video_path.name}: {e}")
 
     def start(self):
         """Start the continuous pipeline."""
-        logger.info("🚀 Starting Continuous Pipeline...")
+        flush_print("🚀 Starting Continuous Pipeline...")
         
         # Scan for and queue any existing videos from previous runs
-        logger.info(f"Scanning for existing videos in {self.video_dir}...")
+        flush_print(f"📂 Scanning for existing videos in {self.video_dir}...")
         try:
             existing_videos = sorted(self.video_dir.glob("*.mp4"))
             if existing_videos:
-                logger.info(f"Found {len(existing_videos)} existing video(s). Adding to processing queue.")
+                flush_print(f"📹 Found {len(existing_videos)} existing video(s). Adding to processing queue.")
                 for video_path in existing_videos:
                     self.video_queue.put(video_path)
+                    flush_print(f"  ➕ Queued: {video_path.name}")
             else:
-                logger.info("No existing videos found.")
+                flush_print("📂 No existing videos found.")
         except Exception as e:
-            logger.error(f"Error scanning for existing videos: {e}")
+            flush_print(f"❌ Error scanning for existing videos: {e}")
 
+        flush_print("🎯 Starting recorder thread...")
         self.recorder_thread = threading.Thread(target=self.recorder.start_continuous_recording, daemon=True)
-        self.processor_thread = threading.Thread(target=self.processor_worker, daemon=True)
         self.recorder_thread.start()
+        
+        flush_print("🎯 Starting processor thread...")
+        self.processor_thread = threading.Thread(target=self.processor_worker, daemon=True)
         self.processor_thread.start()
-        logger.info("✅ All worker threads started")
+        
+        flush_print("✅ All worker threads started")
+        flush_print("🔄 Pipeline is now running. Press Ctrl+C to stop...")
+        
+        # Add a heartbeat to show the main thread is alive
+        heartbeat_count = 0
+        while True:
+            try:
+                time.sleep(30)  # Heartbeat every 30 seconds
+                heartbeat_count += 1
+                if self.verbose or heartbeat_count % 2 == 0:  # Show every minute, or every 30s if verbose
+                    flush_print(f"💓 Heartbeat {heartbeat_count}: Pipeline running (Queue: {self.video_queue.qsize()}, Recorder: {'alive' if self.recorder_thread.is_alive() else 'dead'}, Processor: {'alive' if self.processor_thread.is_alive() else 'dead'})")
+            except KeyboardInterrupt:
+                flush_print("🛑 Keyboard interrupt received")
+                break
+            except Exception as e:
+                flush_print(f"⚠️ Error in main loop: {e}")
+                break
         
     def stop(self):
         """Stop the continuous pipeline gracefully, ensuring all work is finished."""
-        logger.info("🔄 Stopping pipeline... recorder will finish current segment.")
+        flush_print("🔄 Stopping pipeline... recorder will finish current segment.")
         
         # 1. Signal recorder to stop. It will finish its current segment and push it to the queue.
         self.recorder.stop()
         # 2. Wait for the recorder thread to finish its job.
         if self.recorder_thread and self.recorder_thread.is_alive():
+            flush_print("⏳ Waiting for recorder thread to finish...")
             self.recorder_thread.join()
-        logger.info("✅ Recorder thread has stopped.")
+        flush_print("✅ Recorder thread has stopped.")
         
         # 3. Wait for the processor to clear the queue.
-        logger.info("...waiting for processor to finish all remaining videos...")
+        flush_print("⏳ Waiting for processor to finish all remaining videos...")
         self.video_queue.join()
         
         # 4. Signal the processor worker to stop now that the queue is empty.
         self.stop_event.set()
         if self.processor_thread and self.processor_thread.is_alive():
+            flush_print("⏳ Waiting for processor thread to finish...")
             self.processor_thread.join()
-        logger.info("✅ Processor thread has stopped.")
+        flush_print("✅ Processor thread has stopped.")
         
-        logger.info("✅ Pipeline stopped gracefully.")
+        flush_print("✅ Pipeline stopped gracefully.")
 
 def main():
     parser = argparse.ArgumentParser(description='Continuous video recording and inference pipeline.')
@@ -285,6 +343,7 @@ def main():
     parser.add_argument('--sanity-videos-dir', type=str, default='sanity_videos', help='Directory to save sanity video segments.')
     parser.add_argument('--recording-start-hour', type=int, default=6, help='Hour to start recording (24-hour format, default 6 = 6am).')
     parser.add_argument('--recording-end-hour', type=int, default=22, help='Hour to stop recording (24-hour format, default 22 = 10pm).')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose debug output.')
     
     args = parser.parse_args()
     
@@ -292,22 +351,24 @@ def main():
         width, height = map(int, args.resolution.split('x'))
         resolution = (width, height)
     except ValueError:
-        logger.error(f"Error: Invalid resolution format '{args.resolution}'. Use WIDTHxHEIGHT.")
+        flush_print(f"❌ Error: Invalid resolution format '{args.resolution}'. Use WIDTHxHEIGHT.")
         return 1
     
     # Validate recording hours
     if not (0 <= args.recording_start_hour <= 23) or not (0 <= args.recording_end_hour <= 23):
-        logger.error(f"Error: Recording hours must be between 0 and 23. Got start={args.recording_start_hour}, end={args.recording_end_hour}")
+        flush_print(f"❌ Error: Recording hours must be between 0 and 23. Got start={args.recording_start_hour}, end={args.recording_end_hour}")
         return 1
     
     if args.recording_start_hour >= args.recording_end_hour:
-        logger.error(f"Error: Recording start hour ({args.recording_start_hour}) must be less than end hour ({args.recording_end_hour})")
+        flush_print(f"❌ Error: Recording start hour ({args.recording_start_hour}) must be less than end hour ({args.recording_end_hour})")
         return 1
     
     # Validate sanity video percentage
     if not (0 <= args.sanity_video_percentage <= 100):
-        logger.error(f"Error: Sanity video percentage must be between 0 and 100. Got {args.sanity_video_percentage}")
+        flush_print(f"❌ Error: Sanity video percentage must be between 0 and 100. Got {args.sanity_video_percentage}")
         return 1
+    
+    flush_print("🚀 Initializing pipeline...")
     
     pipeline = ContinuousPipeline(
         video_dir=args.video_dir,
@@ -320,17 +381,19 @@ def main():
         detections_dir=args.detections_dir,
         sanity_videos_dir=args.sanity_videos_dir,
         recording_start_hour=args.recording_start_hour,
-        recording_end_hour=args.recording_end_hour
+        recording_end_hour=args.recording_end_hour,
+        verbose=args.verbose
     )
     
     try:
         pipeline.start()
-        while True:
-            time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("🛑 Shutdown initiated by user.")
+        flush_print("🛑 Shutdown initiated by user.")
     except Exception as e:
-        logger.error(f"💥 Fatal error in main loop: {e}", exc_info=True)
+        flush_print(f"💥 Fatal error in main loop: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
     finally:
         pipeline.stop()
     
