@@ -26,46 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Force maximum output flushing with timestamps and hotspot-specific optimizations
+# Simple output function 
 def flush_print(msg):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    full_msg = f"{timestamp} {msg}"
-    print(full_msg, flush=True)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    
-    # Extra aggressive flushing for SSH
-    try:
-        os.fsync(sys.stdout.fileno())
-        os.fsync(sys.stderr.fileno())
-    except:
-        pass
-    
-    # Hotspot-specific optimizations
-    if os.environ.get('HOTSPOT_MODE') == '1':
-        # Even more aggressive flushing for hotspot mode
-        for _ in range(3):  # Multiple flush cycles
-            sys.stdout.flush()
-            sys.stderr.flush()
-            try:
-                os.fsync(sys.stdout.fileno())
-                os.fsync(sys.stderr.fileno())
-            except:
-                pass
-        
-        # Force output to terminal immediately
-        import select
-        import termios
-        try:
-            # Force terminal to update immediately
-            sys.stdout.write('\x1b[0m')  # Reset terminal attributes
-            sys.stdout.flush()
-        except:
-            pass
-        
-        # Small delay to ensure network packet transmission
-        import time
-        time.sleep(0.001)  # 1ms delay for network flush
+    print(msg, flush=True)
 
 class ContinuousPipeline:
     def __init__(self, video_dir="recordings", recording_duration=300, sanity_video_percentage=10, 
@@ -99,9 +62,12 @@ class ContinuousPipeline:
         self.video_queue = queue.Queue()
         self.shutdown_requested = False
         
-        # Set up signal handler for immediate Ctrl+C response
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # Only set up signal handlers if not running in tmux
+        if not os.environ.get('TMUX'):
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        else:
+            flush_print("📋 Running in tmux - signal handling delegated to tmux (use Ctrl+b d to detach)")
 
         # --- Centralized State Management ---
         self.global_frame_count = 0
