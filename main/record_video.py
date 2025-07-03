@@ -64,27 +64,50 @@ class VideoRecorder:
     
     def initialize_camera(self):
         """Initialize and configure the camera."""
-        try:
-            flush_print("📸 Initializing camera...")
-            self.picam2 = Picamera2()
-            camera_config = self.picam2.create_video_configuration(
-                main={"format": 'RGB888', "size": self.resolution}
-            )
-            self.picam2.configure(camera_config)
-            self.picam2.set_controls({
-                "FrameRate": float(self.fps),
-                "AfMode": 0, "LensPosition": 0.0,
-            })
-            self.picam2.start()
-            flush_print("⏳ Camera initializing (waiting 2 seconds)...")
-            time.sleep(2)
-            flush_print("✅ Camera ready.")
-        except Exception as e:
-            flush_print(f"❌ Failed to initialize camera: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.stdout.flush()
-            raise
+        max_retries = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                flush_print(f"📸 Initializing camera (attempt {attempt + 1}/{max_retries})...")
+                
+                # Clean up any existing camera instance
+                if self.picam2:
+                    try:
+                        self.picam2.stop()
+                        self.picam2 = None
+                    except:
+                        pass
+                
+                self.picam2 = Picamera2()
+                camera_config = self.picam2.create_video_configuration(
+                    main={"format": 'RGB888', "size": self.resolution}
+                )
+                self.picam2.configure(camera_config)
+                self.picam2.set_controls({
+                    "FrameRate": float(self.fps),
+                    "AfMode": 0, "LensPosition": 0.0,
+                })
+                self.picam2.start()
+                flush_print("⏳ Camera initializing (waiting 2 seconds)...")
+                time.sleep(2)
+                flush_print("✅ Camera ready.")
+                return  # Success, exit retry loop
+                
+            except Exception as e:
+                flush_print(f"❌ Camera initialization attempt {attempt + 1} failed: {e}")
+                if self.verbose:
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                
+                if attempt < max_retries - 1:
+                    flush_print(f"⏳ Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    flush_print("❌ All camera initialization attempts failed!")
+                    raise
 
     def _stop_camera(self):
         """Stop the camera and frame grabber thread."""
@@ -114,25 +137,41 @@ class VideoRecorder:
         """Continuously grabs frames from the camera and puts them in a queue."""
         flush_print("📹 Frame grabber thread started.")
         frame_count = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
         while not self.stop_event.is_set():
             try:
                 frame = self.picam2.capture_array()
                 try:
                     self.frame_queue.put(frame, timeout=0.1)
                     frame_count += 1
+                    consecutive_errors = 0  # Reset error counter on success
+                    
                     if self.verbose and frame_count % 100 == 0:
                         flush_print(f"📹 Frame grabber: {frame_count} frames captured, queue size: {self.frame_queue.qsize()}")
                 except queue.Full:
                     if self.verbose:
                         flush_print("⚠️ Frame queue full, dropping frame")
                     continue
+                    
             except Exception as e:
+                consecutive_errors += 1
                 if not self.stop_event.is_set():
-                    flush_print(f"❌ Error in frame grabber thread: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    sys.stdout.flush()
-                break
+                    flush_print(f"❌ Error in frame grabber thread ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        flush_print("❌ Too many consecutive frame grabber errors, stopping thread")
+                        import traceback
+                        traceback.print_exc()
+                        sys.stdout.flush()
+                        break
+                    
+                    # Brief pause before retrying
+                    time.sleep(0.1)
+                else:
+                    break
+                    
         flush_print("📹 Frame grabber thread stopped.")
 
     def record_segment(self, output_path):
@@ -198,10 +237,16 @@ class VideoRecorder:
                     # Initialize camera only when we need to record
                     if not camera_initialized:
                         flush_print(f"⏰ Entered recording hours (current time: {current_time.strftime('%H:%M:%S')}) - initializing camera...")
-                        self.initialize_camera()
-                        self.frame_grabber_thread = threading.Thread(target=self._frame_grabber, daemon=True)
-                        self.frame_grabber_thread.start()
-                        camera_initialized = True
+                        try:
+                            self.initialize_camera()
+                            self.frame_grabber_thread = threading.Thread(target=self._frame_grabber, daemon=True)
+                            self.frame_grabber_thread.start()
+                            camera_initialized = True
+                        except Exception as e:
+                            flush_print(f"❌ Failed to initialize camera during recording hours: {e}")
+                            flush_print("⏳ Will retry camera initialization in 5 minutes...")
+                            time.sleep(300)  # Wait 5 minutes before retrying
+                            continue
                     
                     timestamp = current_time.strftime("%Y%m%d_%H%M%S")
                     filename = f"{self.device_id}_{timestamp}.mp4"
@@ -214,6 +259,17 @@ class VideoRecorder:
                         import traceback
                         traceback.print_exc()
                         sys.stdout.flush()
+                        
+                        # Check if this is a camera-related error
+                        if "camera" in str(e).lower() or "frame" in str(e).lower():
+                            flush_print("❌ Camera error detected, reinitializing camera...")
+                            try:
+                                self._stop_camera()
+                                camera_initialized = False
+                                time.sleep(30)  # Wait 30 seconds before retrying
+                            except Exception as recovery_error:
+                                flush_print(f"❌ Error during camera recovery: {recovery_error}")
+                        
                         # Continue to next segment
                         continue
                         

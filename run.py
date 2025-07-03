@@ -283,9 +283,34 @@ class ContinuousPipeline:
         except Exception as e:
             flush_print(f"⚠️ Could not delete video {video_path.name}: {e}")
 
+    def check_disk_space(self):
+        """Check available disk space and return usage stats."""
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage("/")
+            total_gb = total / (1024**3)
+            used_gb = used / (1024**3)
+            free_gb = free / (1024**3)
+            used_percent = (used / total) * 100
+            
+            return {
+                'total_gb': total_gb,
+                'used_gb': used_gb,
+                'free_gb': free_gb,
+                'used_percent': used_percent
+            }
+        except Exception as e:
+            flush_print(f"❌ Error checking disk space: {e}")
+            return None
+
     def start(self):
         """Start the continuous pipeline."""
         flush_print("🚀 Starting Continuous Pipeline...")
+        
+        # Check initial disk space
+        disk_stats = self.check_disk_space()
+        if disk_stats:
+            flush_print(f"💾 Initial disk space: {disk_stats['free_gb']:.1f}GB free / {disk_stats['total_gb']:.1f}GB total ({disk_stats['used_percent']:.1f}% used)")
         
         # Scan for and queue any existing videos from previous runs
         flush_print(f"📂 Scanning for existing videos in {self.video_dir}...")
@@ -314,18 +339,58 @@ class ContinuousPipeline:
         
         # Add a heartbeat to show the main thread is alive
         heartbeat_count = 0
+        disk_check_interval = 120  # Check disk every 2 hours (120 * 30 seconds)
+        
         while True:
             try:
                 time.sleep(30)  # Heartbeat every 30 seconds
                 heartbeat_count += 1
+                
+                # Regular heartbeat
                 if self.verbose or heartbeat_count % 2 == 0:  # Show every minute, or every 30s if verbose
                     flush_print(f"💓 Heartbeat {heartbeat_count}: Pipeline running (Queue: {self.video_queue.qsize()}, Recorder: {'alive' if self.recorder_thread.is_alive() else 'dead'}, Processor: {'alive' if self.processor_thread.is_alive() else 'dead'})")
+                
+                # Periodic disk space check (every 2 hours)
+                if heartbeat_count % disk_check_interval == 0:
+                    disk_stats = self.check_disk_space()
+                    if disk_stats:
+                        flush_print(f"💾 Disk space: {disk_stats['free_gb']:.1f}GB free ({disk_stats['used_percent']:.1f}% used)")
+                        
+                        # Warnings for low disk space
+                        if disk_stats['used_percent'] > 90:
+                            flush_print("⚠️ ⚠️ ⚠️ WARNING: Disk space critically low (>90% used)!")
+                        elif disk_stats['used_percent'] > 80:
+                            flush_print("⚠️ Warning: Disk space getting low (>80% used)")
+                
+                # Check if threads are still alive and restart if needed
+                if not self.recorder_thread.is_alive() and not self.stop_event.is_set():
+                    flush_print("❌ Recorder thread died, attempting to restart...")
+                    try:
+                        self.recorder_thread = threading.Thread(target=self.recorder.start_continuous_recording, daemon=True)
+                        self.recorder_thread.start()
+                        flush_print("✅ Recorder thread restarted")
+                    except Exception as e:
+                        flush_print(f"❌ Failed to restart recorder thread: {e}")
+                
+                if not self.processor_thread.is_alive() and not self.stop_event.is_set():
+                    flush_print("❌ Processor thread died, attempting to restart...")
+                    try:
+                        self.processor_thread = threading.Thread(target=self.processor_worker, daemon=True)
+                        self.processor_thread.start()
+                        flush_print("✅ Processor thread restarted")
+                    except Exception as e:
+                        flush_print(f"❌ Failed to restart processor thread: {e}")
+                
             except KeyboardInterrupt:
                 flush_print("🛑 Keyboard interrupt received")
                 break
             except Exception as e:
                 flush_print(f"⚠️ Error in main loop: {e}")
                 break
+        
+        # Graceful shutdown when exiting main loop
+        flush_print("🔄 Initiating graceful shutdown...")
+        self.stop()
         
     def stop(self):
         """Stop the continuous pipeline gracefully, ensuring all work is finished."""
