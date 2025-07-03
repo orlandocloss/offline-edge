@@ -173,20 +173,15 @@ class ContinuousPipeline:
             traceback.print_exc()
             sys.stdout.flush()
 
-    def should_save_sanity_video(self):
-        """Determine if this video should be saved as a sanity video based on percentage."""
-        return random.randint(1, 100) <= self.sanity_video_percentage
-
     def save_sanity_video(self, video_path):
         """
         Save a video segment as a sanity video.
         The duration of the segment is determined by self.sanity_video_percentage.
         """
-        if self.sanity_video_percentage == 0:
-            return
+        flush_print(f"🎬 Creating sanity video for {video_path.name}...")
         
-        if not self.should_save_sanity_video():
-            flush_print(f"🎯 Skipping sanity video for {video_path.name} (random selection)")
+        if self.sanity_video_percentage == 0:
+            flush_print(f"⏭️  Sanity video disabled (percentage = 0)")
             return
         
         if not (0 < self.sanity_video_percentage <= 100):
@@ -196,6 +191,7 @@ class ContinuousPipeline:
         cap = None
         out = None
         try:
+            flush_print(f"📹 Opening video file: {video_path}")
             cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
                 flush_print(f"❌ Could not open video file to create sanity video: {video_path.name}")
@@ -205,13 +201,18 @@ class ContinuousPipeline:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_duration = total_frames / fps if fps > 0 else 0
+
+            flush_print(f"📊 Video properties: {total_frames} frames, {fps:.2f} FPS, {width}x{height}, {total_duration:.1f}s")
 
             if total_frames == 0 or fps == 0:
                 flush_print(f"❌ Video {video_path.name} has no frames or invalid FPS, cannot create sanity video.")
                 return
 
-            # Calculate segment length in frames
+            # Calculate segment length in frames (percentage of total duration)
             segment_length_frames = int(total_frames * (self.sanity_video_percentage / 100.0))
+            segment_duration = segment_length_frames / fps if fps > 0 else 0
+            
             if segment_length_frames <= 0:
                 flush_print(f"⚠️ Calculated segment length is 0 frames for {video_path.name}. Skipping sanity video.")
                 return
@@ -219,15 +220,22 @@ class ContinuousPipeline:
             # Determine random start frame
             max_start_frame = total_frames - segment_length_frames
             start_frame = random.randint(0, max_start_frame) if max_start_frame > 0 else 0
+            start_time = start_frame / fps if fps > 0 else 0
 
             # Create sanity video path
             sanity_video_path = self.sanity_videos_dir / f"sanity_{video_path.name}"
 
-            flush_print(f"🎬 Creating a {self.sanity_video_percentage}% ({segment_length_frames / fps:.1f}s) sanity video from {video_path.name}")
+            flush_print(f"🎬 Extracting {self.sanity_video_percentage}% ({segment_duration:.1f}s) from {video_path.name}")
+            flush_print(f"📂 Sanity video will be saved to: {sanity_video_path}")
+            flush_print(f"🎯 Random segment: {start_time:.1f}s to {start_time + segment_duration:.1f}s (frames {start_frame} to {start_frame + segment_length_frames})")
             
             # Set up writer for the sanity video
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(str(sanity_video_path), fourcc, fps, (width, height))
+            
+            if not out.isOpened():
+                flush_print(f"❌ Failed to open video writer for {sanity_video_path}")
+                return
 
             # Position the capture to the start frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -236,11 +244,25 @@ class ContinuousPipeline:
             while frames_written < segment_length_frames:
                 ret, frame = cap.read()
                 if not ret:
+                    flush_print(f"⚠️ Could not read frame {start_frame + frames_written}, stopping at {frames_written} frames")
                     break
                 out.write(frame)
                 frames_written += 1
+                
+                # Progress update for longer segments
+                if self.verbose and frames_written % 100 == 0:
+                    progress = (frames_written / segment_length_frames) * 100
+                    flush_print(f"📹 Sanity video progress: {frames_written}/{segment_length_frames} frames ({progress:.1f}%)")
 
-            flush_print(f"✅ Sanity video saved: {sanity_video_path.name}")
+            # Check if file was actually created and has content
+            file_size = 0
+            if sanity_video_path.exists():
+                file_size = sanity_video_path.stat().st_size / (1024 * 1024)  # MB
+            
+            if file_size > 0:
+                flush_print(f"✅ Sanity video saved: {sanity_video_path.name} ({frames_written} frames, {file_size:.1f} MB)")
+            else:
+                flush_print(f"❌ Sanity video file is empty or was not created: {sanity_video_path.name}")
             
         except Exception as e:
             flush_print(f"❌ Error creating sanity video for {video_path.name}: {e}")
@@ -334,7 +356,7 @@ def main():
     parser = argparse.ArgumentParser(description='Continuous video recording and inference pipeline.')
     parser.add_argument('--video-dir', type=str, default='recordings', help='Directory to save and monitor videos.')
     parser.add_argument('--duration', type=int, default=300, help='Duration of each video segment in seconds.')
-    parser.add_argument('--sanity-video-percentage', type=int, default=10, help='Percentage of video *duration* to save as sanity video segment (0-100).')
+    parser.add_argument('--sanity-video-percentage', type=int, default=10, help='Percentage of each video duration to extract as sanity video. 10% = extract 30s from a 300s video (0-100).')
     parser.add_argument('--device-id', type=str, default='pipeline', help='Device identifier for detections.')
     parser.add_argument('--fps', type=int, default=15, help='Recording frame rate.')
     parser.add_argument('--resolution', type=str, default='640x640', help='Recording resolution in WIDTHxHEIGHT format.')
