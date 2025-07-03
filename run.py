@@ -7,6 +7,7 @@ import random
 import logging
 import cv2
 import sys
+import signal
 from datetime import datetime
 from pathlib import Path
 
@@ -27,8 +28,9 @@ logger = logging.getLogger(__name__)
 
 # Force immediate output flushing
 def flush_print(msg):
-    print(msg)
+    print(msg, flush=True)
     sys.stdout.flush()
+    sys.stderr.flush()
 
 class ContinuousPipeline:
     def __init__(self, video_dir="recordings", recording_duration=300, sanity_video_percentage=10, 
@@ -60,6 +62,11 @@ class ContinuousPipeline:
         # Threading controls
         self.stop_event = threading.Event()
         self.video_queue = queue.Queue()
+        self.shutdown_requested = False
+        
+        # Set up signal handler for immediate Ctrl+C response
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
 
         # --- Centralized State Management ---
         self.global_frame_count = 0
@@ -99,6 +106,12 @@ class ContinuousPipeline:
         flush_print(f"📁 Sanity videos directory: {self.sanity_videos_dir}")
         flush_print(f"⏰ Recording schedule: {self.recording_start_hour:02d}:00 - {self.recording_end_hour:02d}:00")
         flush_print("ℹ️  Video processing will continue 24/7, but new recordings only during scheduled hours")
+
+    def _signal_handler(self, signum, frame):
+        """Handle Ctrl+C and termination signals immediately."""
+        signal_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+        flush_print(f"🛑 {signal_name} received - initiating immediate shutdown...")
+        self.shutdown_requested = True
 
     def processor_worker(self):
         """Worker thread to process videos from the queue."""
@@ -339,11 +352,22 @@ class ContinuousPipeline:
         
         # Add a heartbeat to show the main thread is alive
         heartbeat_count = 0
-        disk_check_interval = 120  # Check disk every 2 hours (120 * 30 seconds)
+        disk_check_interval = 240  # Check disk every 2 hours (240 * 5 seconds)
+        thread_check_interval = 12  # Check threads every minute (12 * 5 seconds)
         
-        while True:
+        flush_print("🔄 Main loop starting - press Ctrl+C to stop...")
+        
+        while not self.shutdown_requested:
             try:
-                time.sleep(30)  # Heartbeat every 30 seconds
+                # Sleep in short intervals for responsiveness
+                for i in range(6):  # 6 * 5 = 30 second heartbeat
+                    if self.shutdown_requested:
+                        break
+                    time.sleep(5)  # Check shutdown every 5 seconds
+                
+                if self.shutdown_requested:
+                    break
+                    
                 heartbeat_count += 1
                 
                 # Regular heartbeat
@@ -362,27 +386,29 @@ class ContinuousPipeline:
                         elif disk_stats['used_percent'] > 80:
                             flush_print("⚠️ Warning: Disk space getting low (>80% used)")
                 
-                # Check if threads are still alive and restart if needed
-                if not self.recorder_thread.is_alive() and not self.stop_event.is_set():
-                    flush_print("❌ Recorder thread died, attempting to restart...")
-                    try:
-                        self.recorder_thread = threading.Thread(target=self.recorder.start_continuous_recording, daemon=True)
-                        self.recorder_thread.start()
-                        flush_print("✅ Recorder thread restarted")
-                    except Exception as e:
-                        flush_print(f"❌ Failed to restart recorder thread: {e}")
-                
-                if not self.processor_thread.is_alive() and not self.stop_event.is_set():
-                    flush_print("❌ Processor thread died, attempting to restart...")
-                    try:
-                        self.processor_thread = threading.Thread(target=self.processor_worker, daemon=True)
-                        self.processor_thread.start()
-                        flush_print("✅ Processor thread restarted")
-                    except Exception as e:
-                        flush_print(f"❌ Failed to restart processor thread: {e}")
+                # Check if threads are still alive and restart if needed (every minute)
+                if heartbeat_count % thread_check_interval == 0:
+                    if not self.recorder_thread.is_alive() and not self.stop_event.is_set():
+                        flush_print("❌ Recorder thread died, attempting to restart...")
+                        try:
+                            self.recorder_thread = threading.Thread(target=self.recorder.start_continuous_recording, daemon=True)
+                            self.recorder_thread.start()
+                            flush_print("✅ Recorder thread restarted")
+                        except Exception as e:
+                            flush_print(f"❌ Failed to restart recorder thread: {e}")
+                    
+                    if not self.processor_thread.is_alive() and not self.stop_event.is_set():
+                        flush_print("❌ Processor thread died, attempting to restart...")
+                        try:
+                            self.processor_thread = threading.Thread(target=self.processor_worker, daemon=True)
+                            self.processor_thread.start()
+                            flush_print("✅ Processor thread restarted")
+                        except Exception as e:
+                            flush_print(f"❌ Failed to restart processor thread: {e}")
                 
             except KeyboardInterrupt:
-                flush_print("🛑 Keyboard interrupt received")
+                flush_print("🛑 Keyboard interrupt in main loop")
+                self.shutdown_requested = True
                 break
             except Exception as e:
                 flush_print(f"⚠️ Error in main loop: {e}")
