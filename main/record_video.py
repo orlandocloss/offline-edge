@@ -11,10 +11,46 @@ from picamera2 import Picamera2
 
 logger = logging.getLogger(__name__)
 
-# Force immediate output flushing
+# Force maximum output flushing with timestamps and hotspot-specific optimizations
 def flush_print(msg):
-    print(msg)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    full_msg = f"{timestamp} {msg}"
+    print(full_msg, flush=True)
     sys.stdout.flush()
+    sys.stderr.flush()
+    
+    # Extra aggressive flushing for SSH
+    try:
+        os.fsync(sys.stdout.fileno())
+        os.fsync(sys.stderr.fileno())
+    except:
+        pass
+    
+    # Hotspot-specific optimizations
+    if os.environ.get('HOTSPOT_MODE') == '1':
+        # Even more aggressive flushing for hotspot mode
+        for _ in range(3):  # Multiple flush cycles
+            sys.stdout.flush()
+            sys.stderr.flush()
+            try:
+                os.fsync(sys.stdout.fileno())
+                os.fsync(sys.stderr.fileno())
+            except:
+                pass
+        
+        # Force output to terminal immediately
+        import select
+        import termios
+        try:
+            # Force terminal to update immediately
+            sys.stdout.write('\x1b[0m')  # Reset terminal attributes
+            sys.stdout.flush()
+        except:
+            pass
+        
+        # Small delay to ensure network packet transmission
+        import time
+        time.sleep(0.001)  # 1ms delay for network flush
 
 class VideoRecorder:
     def __init__(self, output_dir="recordings", fps=15, resolution=(640, 640), 
@@ -226,6 +262,7 @@ class VideoRecorder:
     def start_continuous_recording(self):
         """Start continuous recording loop. This is intended to be the target of a thread."""
         flush_print("🚀 Starting continuous recording loop...")
+        flush_print("📋 Recorder thread is now active and monitoring recording schedule...")
         camera_initialized = False
         
         try:
@@ -280,11 +317,17 @@ class VideoRecorder:
                         self._stop_camera()
                         camera_initialized = False
                     
-                    # Sleep for a minute before checking time again
+                    # Calculate next recording time for informative message
+                    next_recording_hour = self.recording_start_hour if current_hour < self.recording_start_hour else self.recording_start_hour + 24
+                    hours_until_recording = (next_recording_hour - current_hour) % 24
+                    
+                    # Sleep for a minute before checking time again, but provide regular updates
                     next_check = 60 - current_time.second  # Sleep until next minute
-                    if self.verbose:
-                        flush_print(f"😴 Outside recording hours (current time: {current_time.strftime('%H:%M:%S')}). Sleeping for {next_check}s...")
-                    time.sleep(next_check)
+                    flush_print(f"😴 Outside recording hours (current time: {current_time.strftime('%H:%M:%S')}). Next recording in ~{hours_until_recording}h. Sleeping for {next_check}s...")
+                    
+                    # Sleep in smaller chunks to provide regular updates during long waits
+                    sleep_duration = min(next_check, 60)  # Maximum 1 minute per sleep
+                    time.sleep(sleep_duration)
         
         except Exception as e:
              if not self.stop_event.is_set():

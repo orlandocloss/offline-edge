@@ -26,11 +26,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Force immediate output flushing
+# Force maximum output flushing with timestamps and hotspot-specific optimizations
 def flush_print(msg):
-    print(msg, flush=True)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    full_msg = f"{timestamp} {msg}"
+    print(full_msg, flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
+    
+    # Extra aggressive flushing for SSH
+    try:
+        os.fsync(sys.stdout.fileno())
+        os.fsync(sys.stderr.fileno())
+    except:
+        pass
+    
+    # Hotspot-specific optimizations
+    if os.environ.get('HOTSPOT_MODE') == '1':
+        # Even more aggressive flushing for hotspot mode
+        for _ in range(3):  # Multiple flush cycles
+            sys.stdout.flush()
+            sys.stderr.flush()
+            try:
+                os.fsync(sys.stdout.fileno())
+                os.fsync(sys.stderr.fileno())
+            except:
+                pass
+        
+        # Force output to terminal immediately
+        import select
+        import termios
+        try:
+            # Force terminal to update immediately
+            sys.stdout.write('\x1b[0m')  # Reset terminal attributes
+            sys.stdout.flush()
+        except:
+            pass
+        
+        # Small delay to ensure network packet transmission
+        import time
+        time.sleep(0.001)  # 1ms delay for network flush
 
 class ContinuousPipeline:
     def __init__(self, video_dir="recordings", recording_duration=300, sanity_video_percentage=10, 
@@ -71,6 +106,18 @@ class ContinuousPipeline:
         # --- Centralized State Management ---
         self.global_frame_count = 0
         self.tracker = None
+        
+        # Check current recording time status immediately
+        current_time = datetime.now()
+        is_recording_time = self.recording_start_hour <= current_time.hour < self.recording_end_hour
+        flush_print(f"⏰ Current time: {current_time.strftime('%H:%M:%S')}")
+        flush_print(f"📅 Recording schedule: {self.recording_start_hour:02d}:00 - {self.recording_end_hour:02d}:00")
+        if is_recording_time:
+            flush_print("✅ Currently within recording hours - camera will start immediately")
+        else:
+            next_recording_hour = self.recording_start_hour if current_time.hour < self.recording_start_hour else self.recording_start_hour + 24
+            hours_until_recording = (next_recording_hour - current_time.hour) % 24
+            flush_print(f"⏰ Currently outside recording hours - next recording in ~{hours_until_recording} hours")
         
         # --- Centralized Tracker Initialization ---
         flush_print("🔄 Initializing insect tracker...")
@@ -116,6 +163,9 @@ class ContinuousPipeline:
     def processor_worker(self):
         """Worker thread to process videos from the queue."""
         flush_print("🔍 Starting video processor worker...")
+        
+        # Initial status
+        flush_print("🔍 Video processor worker is now active and waiting for videos...")
         
         while not self.stop_event.is_set() or not self.video_queue.empty():
             try:
@@ -342,20 +392,23 @@ class ContinuousPipeline:
         flush_print("🎯 Starting recorder thread...")
         self.recorder_thread = threading.Thread(target=self.recorder.start_continuous_recording, daemon=True)
         self.recorder_thread.start()
+        flush_print("✅ Recorder thread started and is now active")
         
         flush_print("🎯 Starting processor thread...")
         self.processor_thread = threading.Thread(target=self.processor_worker, daemon=True)
         self.processor_thread.start()
+        flush_print("✅ Processor thread started and is now active")
         
-        flush_print("✅ All worker threads started")
-        flush_print("🔄 Pipeline is now running. Press Ctrl+C to stop...")
+        flush_print("✅ All worker threads started and active")
+        flush_print("🔄 Pipeline is now fully operational. Press Ctrl+C to stop...")
         
         # Add a heartbeat to show the main thread is alive
         heartbeat_count = 0
         disk_check_interval = 240  # Check disk every 2 hours (240 * 5 seconds)
         thread_check_interval = 12  # Check threads every minute (12 * 5 seconds)
         
-        flush_print("🔄 Main loop starting - press Ctrl+C to stop...")
+        flush_print("🔄 Main loop starting - monitoring system health...")
+        flush_print("💓 You should see heartbeat messages every 30 seconds (or every 30s if verbose)")
         
         while not self.shutdown_requested:
             try:
